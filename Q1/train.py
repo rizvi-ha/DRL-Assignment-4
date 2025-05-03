@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -45,13 +46,13 @@ class ReplayBuffer:
     def sample(self, batch_size):
         batch = random.sample(self.buf, batch_size)
         t = Transition(*zip(*batch))
-        states = torch.as_tensor(t.state, dtype=torch.float32, device=device)
-        actions = torch.as_tensor(t.action, dtype=torch.float32, device=device)
-        rewards = torch.as_tensor(t.reward, dtype=torch.float32,
+        states = torch.as_tensor(np.stack(t.state), dtype=torch.float32, device=device)
+        actions = torch.as_tensor(np.stack(t.action), dtype=torch.float32, device=device)
+        rewards = torch.as_tensor(np.array(t.reward), dtype=torch.float32,
                                   device=device).unsqueeze(1)
-        next_states = torch.as_tensor(t.next_state, dtype=torch.float32,
+        next_states = torch.as_tensor(np.stack(t.next_state), dtype=torch.float32,
                                       device=device)
-        dones = torch.as_tensor(t.done, dtype=torch.float32,
+        dones = torch.as_tensor(np.array(t.done), dtype=torch.float32,
                                 device=device).unsqueeze(1)
         return states, actions, rewards, next_states, dones
 
@@ -179,8 +180,9 @@ def train(seed=0):
     episode_reward, episode_steps = 0.0, 0
     ep = 0
     best_eval = -float("inf")
+    pbar = tqdm(range(1, MAX_STEPS + 1))
 
-    for t in range(1, MAX_STEPS + 1):
+    for t in pbar:
         # Exploration vs. policy action
         if t < START_STEPS:
             action = env.action_space.sample()
@@ -202,8 +204,7 @@ def train(seed=0):
         episode_steps += 1
 
         if done:
-            print(f"Episode {ep:4d} | steps {episode_steps:3d} | "
-                  f"return {episode_reward:7.1f}")
+            pbar.set_description(f"Episode {ep:4d} | steps {episode_steps:3d} | " +  f"return {episode_reward:7.1f}")
             state, _ = env.reset()
             episode_reward, episode_steps = 0.0, 0
             ep += 1
