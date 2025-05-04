@@ -100,6 +100,11 @@ def evaluate(actor,eps=10):
 
 # ── main training loop ─────────────────────────────────────────────────────────
 def train(seed=0):
+
+    # Open log file
+    log_path = "td3_humanoid.log"
+    log_file = open(log_path, "w")
+
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     env=make_env(seed)
     sdim=env.observation_space.shape[0]      # 67  :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
@@ -126,16 +131,20 @@ def train(seed=0):
         buf.push(s,a,r,s2,float(done)); s=s2; ep_r+=r; ep_len+=1
         if done:
             pbar.set_description(f"Ep {ep:4d} | len {ep_len:4d} | return {ep_r:6.1f}")
+            log_file.write(f"Ep {ep:4d} | len {ep_len:4d} | return {ep_r:6.1f}\n")
             s,_=env.reset(); ep_r=0; ep_len=0; ep+=1
         if t>=START_STEPS:
             td3_step(buf,actor,act_t,q1,q2,q1_t,q2_t,opt_a,opt_q1,opt_q2,t)
         if t%EVAL_INTERVAL==0:
             score=evaluate(actor,eps=20)
             print(f"[eval {t//1000:4d}k] score {score:7.1f}")
+            log_file.write(f"[eval {t//1000:4d}k] score {score:7.1f}\n")
+            log_file.flush()
             if score>best:
                 best=score
                 torch.save(actor.state_dict(),"td3_humanoid_actor.pth")
                 print("  ↳ new best saved")
+    log_file.close()
     env.close(); print(f"Finished; best score {best:.1f}")
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
