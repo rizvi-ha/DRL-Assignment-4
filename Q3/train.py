@@ -8,8 +8,8 @@ from tqdm import tqdm
 
 # ── hyper-params ────────────────────────────────────────────────────────────────
 HIDDEN        = 400
-ACTOR_LR      = 3e-4
-CRITIC_LR     = 3e-4
+ACTOR_LR      = 6e-4
+CRITIC_LR     = 1e-3
 GAMMA         = 0.99
 TAU           = 0.005
 POLICY_DELAY  = 2
