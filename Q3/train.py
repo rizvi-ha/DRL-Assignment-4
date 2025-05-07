@@ -20,6 +20,7 @@ BATCH_SIZE    = 512
 START_STEPS   = 25_000
 MAX_STEPS     = 1_000_000
 EVAL_INTERVAL = 50_000
+NO_FALL_DATA_STEPS = 500_000
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 T = namedtuple("Transition", "s a r s2 d")
@@ -129,6 +130,8 @@ def train(seed=0):
             a=(a+np.random.normal(0,0.1,adim)).clip(-amax,amax)
         s2,r,term,trunc,_=env.step(a); done=term or trunc
         buf.push(s,a,r,s2,float(done)); s=s2; ep_r+=r; ep_len+=1
+        if t < NO_FALL_DATA_STEPS and r < 1e-10 and ep_len > 80:
+            done = True
         if done:
             pbar.set_description(f"Ep {ep:4d} | len {ep_len:4d} | return {ep_r:6.1f}")
             log_file.write(f"Ep {ep:4d} | len {ep_len:4d} | return {ep_r:6.1f}\n")
