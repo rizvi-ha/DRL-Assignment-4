@@ -2,155 +2,235 @@ import argparse, os, random
 from collections import deque, namedtuple
 
 import numpy as np
-import torch, torch.nn as nn, torch.optim as optim
-from dmc import make_dmc_env            # provided by assignment repo
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from dmc import make_dmc_env
 from tqdm import tqdm
 
-# ── hyper-params ────────────────────────────────────────────────────────────────
-HIDDEN        = 400
-ACTOR_LR      = 6e-4
-CRITIC_LR     = 1e-3
-GAMMA         = 0.99
-TAU           = 0.005
-POLICY_DELAY  = 2
-POLICY_NOISE  = 0.2
-NOISE_CLIP    = 0.5
-REPLAY_SIZE   = int(2e6)
-BATCH_SIZE    = 512
-START_STEPS   = 25_000
-MAX_STEPS     = 1_000_000
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Hyper-parameters  (tweak as desired)
+# ────────────────────────────────────────────────────────────────────────────────
+HIDDEN1, HIDDEN2 = 400, 300       
+ACTOR_LR = 1e-4
+CRITIC_LR = 1e-3
+GAMMA = 0.99
+TAU = 5e-3                      
+REPLAY_SIZE = int(1e6)
+BATCH_SIZE = 512                 
+START_STEPS = 20_000                 # purely random before training
+MAX_STEPS = 1_000_000
 EVAL_INTERVAL = 50_000
-NO_FALL_DATA_STEPS = 500_000
+NOISE_STD_INIT = 0.2                 # exploration noise σ
+NOISE_STD_FINAL = 0.05
+SCHED_GAMMA = 0.9999                 # LR exponential decay
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-T = namedtuple("Transition", "s a r s2 d")
+Transition = namedtuple("Transition",
+                        "state action reward next_state done")
 
-# ── replay buffer ───────────────────────────────────────────────────────────────
-class ReplayBuf:
-    def __init__(self, cap): self.buf=deque(maxlen=cap)
-    def push(self,*x): self.buf.append(T(*x))
-    def __len__(self): return len(self.buf)
-    def sample(self,k):
-        b=random.sample(self.buf,k); t=T(*zip(*b))
-        s  =torch.as_tensor(np.stack(t.s),  dtype=torch.float32,device=device)
-        a  =torch.as_tensor(np.stack(t.a),  dtype=torch.float32,device=device)
-        r  =torch.as_tensor(np.array(t.r),  dtype=torch.float32,device=device).unsqueeze(1)
-        s2 =torch.as_tensor(np.stack(t.s2), dtype=torch.float32,device=device)
-        d  =torch.as_tensor(np.array(t.d),  dtype=torch.float32,device=device).unsqueeze(1)
-        return s,a,r,s2,d
 
-# ── networks ────────────────────────────────────────────────────────────────────
-def mlp(inp,out,hidden=HIDDEN,tanh=False):
-    layers=[nn.Linear(inp,hidden),nn.ReLU(),
-            nn.Linear(hidden,hidden),nn.ReLU(),
-            nn.Linear(hidden,out)]
-    if tanh: layers.append(nn.Tanh())
+# ────────────────────────────────────────────────────────────────────────────────
+# Replay buffer
+# ────────────────────────────────────────────────────────────────────────────────
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buf = deque(maxlen=capacity)
+
+    def push(self, *args):
+        self.buf.append(Transition(*args))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buf, batch_size)
+        t = Transition(*zip(*batch))
+        s      = torch.as_tensor(np.stack(t.state),      dtype=torch.float32, device=device)
+        a      = torch.as_tensor(np.stack(t.action),     dtype=torch.float32, device=device)
+        r      = torch.as_tensor(np.array(t.reward),     dtype=torch.float32, device=device).unsqueeze(1)
+        s2     = torch.as_tensor(np.stack(t.next_state), dtype=torch.float32, device=device)
+        d      = torch.as_tensor(np.array(t.done),       dtype=torch.float32, device=device).unsqueeze(1)
+        return s, a, r, s2, d
+
+    def __len__(self):
+        return len(self.buf)
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Networks
+# ────────────────────────────────────────────────────────────────────────────────
+def mlp(in_dim, out_dim, hidden1=HIDDEN1, hidden2=HIDDEN2, final_tanh=False):
+    layers = [ nn.Linear(in_dim, hidden1), nn.ReLU(),
+               nn.Linear(hidden1, hidden2), nn.ReLU(),
+               nn.Linear(hidden2, out_dim) ]
+    if final_tanh: layers.append(nn.Tanh())
     return nn.Sequential(*layers)
 
+
 class Actor(nn.Module):
-    def __init__(self,sdim,adim,amax):
+    def __init__(self, state_dim, action_dim, action_max):
         super().__init__()
-        self.body=mlp(sdim,adim,tanh=True); self.amax=amax
-    def forward(self,s): return self.body(s)*self.amax
+        self.net = mlp(state_dim, action_dim, final_tanh=True)
+        self.scale = action_max
+
+    def forward(self, s):
+        return self.net(s) * self.scale
+
 
 class Critic(nn.Module):
-    def __init__(self,sdim,adim):
-        super().__init__(); self.q=mlp(sdim+adim,1)
-    def forward(self,s,a): return self.q(torch.cat([s,a],dim=-1))
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.net = mlp(state_dim + action_dim, 1)
 
-# ── utils ───────────────────────────────────────────────────────────────────────
+    def forward(self, s, a):
+        return self.net(torch.cat([s, a], dim=-1))
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Utils
+# ────────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def polyak(trg,src,tau): 
-    for tp,p in zip(trg.parameters(),src.parameters()):
-        tp.data.mul_(1-tau).add_(p.data,alpha=tau)
+def soft_update(target, src, tau):
+    for tg, src_p in zip(target.parameters(), src.parameters()):
+        tg.data.mul_(1 - tau).add_(src_p.data, alpha=tau)
 
-def td3_step(buf,act,act_t,q1,q2,q1_t,q2_t,opt_a,opt_q1,opt_q2,step):
-    if len(buf)<BATCH_SIZE: return
-    s,a,r,s2,d=buf.sample(BATCH_SIZE)
-    noise=(torch.randn_like(a)*POLICY_NOISE).clamp(-NOISE_CLIP,NOISE_CLIP)
-    a2=(act_t(s2)+noise).clamp(-1.0,1.0)
-    with torch.no_grad():
-        y=r+GAMMA*(1-d)*torch.min(q1_t(s2,a2),q2_t(s2,a2))
-    # critics
-    loss_q=nn.functional.mse_loss(q1(s,a),y)+nn.functional.mse_loss(q2(s,a),y)
-    opt_q1.zero_grad(); opt_q2.zero_grad(); loss_q.backward(); opt_q1.step(); opt_q2.step()
-    # delayed actor + targets
-    if step%POLICY_DELAY==0:
-        loss_a=-q1(s,act(s)).mean()
-        opt_a.zero_grad(); loss_a.backward(); opt_a.step()
-        polyak(act_t,act,TAU); polyak(q1_t,q1,TAU); polyak(q2_t,q2,TAU)
 
-# ── environment helpers ────────────────────────────────────────────────────────
-def make_env(seed=0):
-    env=make_dmc_env("humanoid-walk",
-                     seed,
-                     flatten=True,use_pixels=False)
+@torch.no_grad()
+def evaluate(actor, episodes=20):
+    env = make_env()
+    returns = []
+    for _ in range(episodes):
+        s, _ = env.reset(seed=np.random.randint(0, 1_000_000))
+        ep_r, done = 0.0, False
+        while not done:
+            a = actor(torch.as_tensor(s, dtype=torch.float32,
+                                      device=device).unsqueeze(0))
+            s, r, term, trunc, _ = env.step(a.cpu().numpy()[0])
+            ep_r += r
+            done = term or trunc
+        returns.append(ep_r)
+    env.close()
+    r = np.array(returns)
+    return float(r.mean() - r.std())
+
+
+def make_env(seed=None):
+    env = make_dmc_env("humanoid-walk",
+                       seed if seed is not None else np.random.randint(0, 1_000_000),
+                       flatten=True, use_pixels=False)
     return env
 
-# ── evaluation (mean - std) ────────────────────────────────────────────────────
-@torch.no_grad()
-def evaluate(actor,eps=10):
-    env=make_env(); scores=[]
-    for _ in range(eps):
-        s,_=env.reset(seed=np.random.randint(0,1)); ep_r=0; done=False
-        while not done:
-            a=actor(torch.as_tensor(s,dtype=torch.float32,device=device).unsqueeze(0))
-            s,r,term,trunc,_=env.step(a.cpu().numpy()[0]); ep_r+=r; done=term or trunc
-        scores.append(ep_r)
-    env.close(); return float(np.mean(scores)-np.std(scores))
 
-# ── main training loop ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ────────────────────────────────────────────────────────────────────────────────
 def train(seed=0):
+    random.seed(seed);  np.random.seed(seed);  torch.manual_seed(seed)
 
-    # Open log file
-    log_path = "td3_humanoid.log"
-    log_file = open(log_path, "w")
+    env = make_env(seed)
+    state_dim  = env.observation_space.shape[0]      # 67
+    action_dim = env.action_space.shape[0]           # 21
+    action_max = float(env.action_space.high[0])     # 1.0
 
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    env=make_env(seed)
-    sdim=env.observation_space.shape[0]      # 67  :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
-    adim=env.action_space.shape[0]           # 21  :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
-    amax=float(env.action_space.high[0])
-    actor=Actor(sdim,adim,amax).to(device);  act_t=Actor(sdim,adim,amax).to(device)
-    q1=Critic(sdim,adim).to(device); q2=Critic(sdim,adim).to(device)
-    q1_t=Critic(sdim,adim).to(device); q2_t=Critic(sdim,adim).to(device)
-    act_t.load_state_dict(actor.state_dict()); q1_t.load_state_dict(q1.state_dict()); q2_t.load_state_dict(q2.state_dict())
-    opt_a=optim.Adam(actor.parameters(),ACTOR_LR)
-    opt_q1=optim.Adam(q1.parameters(),CRITIC_LR); opt_q2=optim.Adam(q2.parameters(),CRITIC_LR)
-    buf=ReplayBuf(REPLAY_SIZE)
+    # networks + target copies
+    actor  = Actor(state_dim, action_dim, action_max).to(device)
+    critic = Critic(state_dim, action_dim).to(device)
+    act_t  = Actor(state_dim, action_dim, action_max).to(device)
+    crt_t  = Critic(state_dim, action_dim).to(device)
+    act_t.load_state_dict(actor.state_dict())
+    crt_t.load_state_dict(critic.state_dict())
 
-    s,_=env.reset(); ep_r=0; ep_len=0; ep=0; best=-float("inf")
-    pbar = tqdm(range(1,MAX_STEPS+1))
+    act_optim = optim.Adam(actor.parameters(),  lr=ACTOR_LR)
+    crt_optim = optim.Adam(critic.parameters(), lr=CRITIC_LR)
+
+    # exponential LR schedulers
+    act_sched = optim.lr_scheduler.ExponentialLR(act_optim, gamma=SCHED_GAMMA)
+    crt_sched = optim.lr_scheduler.ExponentialLR(crt_optim, gamma=SCHED_GAMMA)
+
+    buf = ReplayBuffer(REPLAY_SIZE)
+
+    s, _ = env.reset()
+    ep_r, ep_len, ep = 0.0, 0, 0
+    best_score = -float("inf")
+    pbar = tqdm(range(1, MAX_STEPS + 1))
+
     for t in pbar:
-        if t<START_STEPS: a=env.action_space.sample()
+        # exploration noise annealed linearly
+        frac = min(1.0, t / MAX_STEPS)
+        sigma = NOISE_STD_INIT + (NOISE_STD_FINAL - NOISE_STD_INIT) * frac
+        if t < START_STEPS:
+            a = env.action_space.sample()
         else:
             with torch.no_grad():
-                a=actor(torch.as_tensor(s,dtype=torch.float32,device=device).unsqueeze(0))
-                a=a.cpu().numpy()[0]
-            a=(a+np.random.normal(0,0.1,adim)).clip(-amax,amax)
-        s2,r,term,trunc,_=env.step(a); done=term or trunc
-        buf.push(s,a,r,s2,float(done)); s=s2; ep_r+=r; ep_len+=1
-        if t < NO_FALL_DATA_STEPS and r < 1e-10 and ep_len > 80:
-            done = True
-        if done:
-            pbar.set_description(f"Ep {ep:4d} | len {ep_len:4d} | return {ep_r:6.1f}")
-            log_file.write(f"Ep {ep:4d} | len {ep_len:4d} | return {ep_r:6.1f}\n")
-            s,_=env.reset(); ep_r=0; ep_len=0; ep+=1
-        if t>=START_STEPS:
-            td3_step(buf,actor,act_t,q1,q2,q1_t,q2_t,opt_a,opt_q1,opt_q2,t)
-        if t%EVAL_INTERVAL==0:
-            score=evaluate(actor,eps=20)
-            print(f"[eval {t//1000:4d}k] score {score:7.1f}")
-            log_file.write(f"[eval {t//1000:4d}k] score {score:7.1f}\n")
-            log_file.flush()
-            if score>best:
-                best=score
-                torch.save(actor.state_dict(),"td3_humanoid_actor.pth")
-                print("  ↳ new best saved")
-    log_file.close()
-    env.close(); print(f"Finished; best score {best:.1f}")
+                a = actor(torch.as_tensor(s, dtype=torch.float32,
+                                          device=device).unsqueeze(0))
+                a = a.cpu().numpy()[0]
+            a = (a + np.random.normal(0, sigma, size=action_dim)
+                 ).clip(-action_max, action_max)
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
-if __name__=="__main__":
-    p=argparse.ArgumentParser(); p.add_argument("--seed",type=int,default=0)
-    train(**vars(p.parse_args()))
+        s2, r, term, trunc, _ = env.step(a)
+        done = term or trunc
+        buf.push(s, a, r, s2, float(done))
+
+        s = s2
+        ep_r += r;  ep_len += 1
+
+        # episode end
+        if done:
+            pbar.set_description(f"Ep {ep:4d} | len {ep_len:4d} | return {ep_r:9.1f}")
+            s, _ = env.reset()
+            ep_r, ep_len, ep = 0.0, 0, ep + 1
+
+        # update after warm-up
+        if t >= START_STEPS and len(buf) >= BATCH_SIZE:
+            # sample
+            ss, aa, rr, ss2, dd = buf.sample(BATCH_SIZE)
+
+            # target actions (no policy noise in plain DDPG target)
+            with torch.no_grad():
+                a2 = act_t(ss2)
+                q2 = crt_t(ss2, a2)
+                y = rr + GAMMA * (1 - dd) * q2
+
+            # critic update
+            q = critic(ss, aa)
+            crt_loss = nn.functional.mse_loss(q, y)
+            crt_optim.zero_grad()
+            crt_loss.backward()
+            crt_optim.step()
+
+            # actor update (policy gradient)
+            act_loss = -critic(ss, actor(ss)).mean()
+            act_optim.zero_grad()
+            act_loss.backward()
+            act_optim.step()
+
+            # target net slow update
+            soft_update(act_t, actor, TAU)
+            soft_update(crt_t, critic, TAU)
+
+            # LR decay
+            act_sched.step()
+            crt_sched.step()
+
+        # quick deterministic eval
+        if t % EVAL_INTERVAL == 0:
+            score = evaluate(actor, episodes=10)
+            print(f"[eval {t:7d}] mean-std score: {score:8.1f}")
+            if score > best_score:
+                best_score = score
+                torch.save(actor.state_dict(), "ddpg_humanoid_actor.pth")
+                print("  ↳ new best saved  (score ↑)")
+    env.close()
+    print(f"Training finished. Best score = {best_score:.1f}")
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# CLI
+# ────────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    train(seed=args.seed)
+
